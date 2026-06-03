@@ -107,6 +107,7 @@ from tools.browser_tool import cleanup_browser
 
 # Agent internals extracted to agent/ package for modularity
 from agent.memory_manager import sanitize_context
+from agent.subdirectory_hints import SubdirectoryHintTracker  # noqa: F401
 from agent.error_classifier import FailoverReason
 from agent.redact import redact_sensitive_text
 from agent.model_metadata import (
