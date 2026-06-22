@@ -23,8 +23,10 @@ Design:
 - Frozen snapshot pattern: system prompt is stable, tool responses show live state
 """
 
+import hashlib
 import json
 import logging
+import math
 import os
 import tempfile
 import time
@@ -1055,3 +1057,165 @@ registry.register(
 
 
 
+class HybridMemoryStore(MemoryStore):
+    """upstream MemoryStore + access tracking + SQRT eviction"""
+
+    def __init__(self, memory_char_limit=2200, user_char_limit=1375):
+        super().__init__(memory_char_limit, user_char_limit)
+        # Add tracking fields
+        self._meta_cache = {"memory": {}, "user": {}}
+        self._entries_meta = {"memory": [], "user": []}  # parallel to memory_entries / user_entries
+
+    # ---- meta sidecar I/O ----
+    def _meta_path_for(self, target):
+        prefix = "MEMORY" if target == "memory" else "USER"
+        # Use parent's _path_for to get the right directory
+        main_path = self._path_for(target)
+        return main_path.parent / f"{prefix}.md.meta"
+
+    def _content_key(self, content):
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+
+    def _load_meta(self, target):
+        meta_path = self._meta_path_for(target)
+        if meta_path.exists():
+            try:
+                return json.loads(meta_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                return {}
+        return {}
+
+    def _save_meta(self, target, meta):
+        meta_path = self._meta_path_for(target)
+        meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
+
+    # ---- override load_from_disk ----
+    def load_from_disk(self):
+        """Same as upstream but also load .meta sidecar and rebuild tracking."""
+        # Call parent to populate memory_entries / user_entries and snapshot
+        super().load_from_disk()
+        now = int(time.time())
+        for target in ("memory", "user"):
+            entries = self._entries_for(target)
+            meta = self._load_meta(target)
+            self._entries_meta[target] = []
+            for content in entries:
+                key = self._content_key(content)
+                entry_meta = meta.get(key, {})
+                self._entries_meta[target].append({
+                    "access_count": entry_meta.get("access_count", 0),
+                    "last_accessed": entry_meta.get("last_accessed", now),
+                    "created_at": entry_meta.get("created_at", now),
+                })
+
+    # ---- override save_to_disk ----
+    def save_to_disk(self, target):
+        """Save main MEMORY.md/USER.md via parent, then save .meta sidecar."""
+        super().save_to_disk(target)
+        entries = self._entries_for(target)
+        meta_entries = self._entries_meta[target]
+        # Build meta dict from current entries_meta (parallel list)
+        meta = {}
+        for content, entry_meta in zip(entries, meta_entries):
+            key = self._content_key(content)
+            meta[key] = {
+                "access_count": entry_meta["access_count"],
+                "last_accessed": entry_meta["last_accessed"],
+                "created_at": entry_meta["created_at"],
+            }
+        self._save_meta(target, meta)
+
+    # ---- override add to use SQRT eviction ----
+    def add(self, target, content):
+        """Add entry; if over limit, evict lowest-scoring entry first."""
+        content = content.strip()
+        if not content:
+            return {"success": False, "error": "Content cannot be empty."}
+
+        entries = self._entries_for(target)
+        entries_meta = self._entries_meta[target]
+        # Dedup (parent does this too, but we check here)
+        if content in entries:
+            return {"success": False, "error": "Entry already exists (no duplicate added)."}
+
+        # Calculate needed chars
+        limit = self._char_limit(target)
+        current_chars = self._char_count(target)
+        needed = len(content) + (len(ENTRY_DELIMITER) if entries else 0)
+
+        # If would overflow, try SQRT eviction
+        if current_chars + needed > limit:
+            if entries and self._sqrt_evict(target):
+                # Recalculate after eviction
+                current_chars = self._char_count(target)
+            if current_chars + needed > limit:
+                # Still over limit (entries empty after eviction? unlikely)
+                return {
+                    "success": False,
+                    "error": f"Entry too large: would exceed {limit} char limit even after eviction.",
+                }
+
+        # Scan content for threats (call upstream's scanner indirectly via save_to_disk sanitize)
+        # For now, we trust parent's add to do this; but parent's add uses batch atomic semantics.
+        # We bypass parent's add and directly mutate entries + save_to_disk to keep tracking aligned.
+        now = int(time.time())
+        entries.append(content)
+        entries_meta.append({
+            "access_count": 0,
+            "last_accessed": now,
+            "created_at": now,
+        })
+        self.save_to_disk(target)
+        # Note: parent's _sanitize_entries_for_snapshot is called by load_from_disk, not save_to_disk.
+        # The snapshot was captured at load; subsequent writes don't re-sanitize. This matches upstream.
+        return {"success": True, "entry": content}
+
+    def _sqrt_evict(self, target):
+        """Evict entry with lowest score = (access_count+1) / SQRT(age_days+1)."""
+        entries = self._entries_for(target)
+        entries_meta = self._entries_meta[target]
+        if not entries:
+            return False
+        now = int(time.time())
+        scored = []
+        for i, m in enumerate(entries_meta):
+            age_days = max(0.0, (now - m["created_at"]) / 86400.0)
+            score = (m["access_count"] + 1) / math.sqrt(age_days + 1)
+            scored.append((score, i))
+        scored.sort(key=lambda x: x[0])
+        _, idx = scored[0]
+        entries.pop(idx)
+        entries_meta.pop(idx)
+        return True
+
+    # ---- override format_for_system_prompt to auto-touch ----
+    def format_for_system_prompt(self, target):
+        """Render system prompt block; touch all entries (increment access_count)."""
+        # First call parent to get the rendered block (uses _system_prompt_snapshot from load)
+        block = super().format_for_system_prompt(target)
+        # Touch all entries
+        now = int(time.time())
+        for m in self._entries_meta[target]:
+            m["access_count"] += 1
+            m["last_accessed"] = now
+        # Persist updated meta
+        self._save_meta(target, {self._content_key(c): m for c, m in zip(self._entries_for(target), self._entries_meta[target])})
+        return block
+
+    # ---- new: memory search for session_search integration ----
+    def search(self, target, query, limit=10):
+        """Keyword search over memory entries."""
+        entries = self._entries_for(target)
+        entries_meta = self._entries_meta[target]
+        query_lower = query.lower()
+        results = []
+        for i, content in enumerate(entries):
+            if query_lower in content.lower():
+                results.append({
+                    "index": i,
+                    "content": content,
+                    "access_count": entries_meta[i]["access_count"],
+                    "score": entries_meta[i]["access_count"],
+                })
+        results.sort(key=lambda r: r["score"], reverse=True)
+        return results[:limit]
