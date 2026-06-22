@@ -935,8 +935,45 @@ def memory_tool(
     elif action == "remove":
         result = store.remove(target, old_text)
 
+    elif action == "list_archived":
+        # Only valid for HybridMemoryStore; upstream MemoryStore has no archive.
+        if not hasattr(store, "list_archived"):
+            return tool_error(
+                "list_archived requires HybridMemoryStore (this deployment uses "
+                "upstream MemoryStore which has no archive).",
+                success=False,
+            )
+        items = store.list_archived(target)
+        return json.dumps({
+            "success": True,
+            "target": target,
+            "archived_count": len(items),
+            "items": items,
+        }, ensure_ascii=False)
+
+    elif action == "restore_archived":
+        if not hasattr(store, "restore_archived"):
+            return tool_error(
+                "restore_archived requires HybridMemoryStore (this deployment "
+                "uses upstream MemoryStore which has no archive).",
+                success=False,
+            )
+        if not old_text:
+            return tool_error(
+                "old_text is required for 'restore_archived' action "
+                "(use the 'key' field from list_archived).",
+                success=False,
+            )
+        ok, msg = store.restore_archived(target, old_text)
+        result = {"success": ok, "message": msg}
+        return json.dumps(result, ensure_ascii=False)
+
     else:
-        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
+        return tool_error(
+            f"Unknown action '{action}'. Use: add, replace, remove, "
+            f"list_archived, restore_archived",
+            success=False,
+        )
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -1143,9 +1180,11 @@ class HybridMemoryStore(MemoryStore):
         current_chars = self._char_count(target)
         needed = len(content) + (len(ENTRY_DELIMITER) if entries else 0)
 
-        # If would overflow, try SQRT eviction
+        # If would overflow, try archive-evict (lowest-score entry gets archived
+        # to .archive sidecar, then live list pops; on next load the archived
+        # entry is invisible to live but still restorable).
         if current_chars + needed > limit:
-            if entries and self._sqrt_evict(target):
+            if entries and self._archive_evict(target):
                 # Recalculate after eviction
                 current_chars = self._char_count(target)
             if current_chars + needed > limit:
@@ -1171,11 +1210,15 @@ class HybridMemoryStore(MemoryStore):
         return {"success": True, "entry": content}
 
     def _sqrt_evict(self, target):
-        """Evict entry with lowest score = (access_count+1) / SQRT(age_days+1)."""
+        """Evict entry with lowest score = (access_count+1) / SQRT(age_days+1).
+
+        Returns (ok, score) where ok is True if evicted and score is the
+        evicted entry's score (useful for archiving the score with the entry).
+        """
         entries = self._entries_for(target)
         entries_meta = self._entries_meta[target]
         if not entries:
-            return False
+            return False, 0.0
         now = int(time.time())
         scored = []
         for i, m in enumerate(entries_meta):
@@ -1183,10 +1226,126 @@ class HybridMemoryStore(MemoryStore):
             score = (m["access_count"] + 1) / math.sqrt(age_days + 1)
             scored.append((score, i))
         scored.sort(key=lambda x: x[0])
-        _, idx = scored[0]
+        score, idx = scored[0]
+        entries.pop(idx)
+        entries_meta.pop(idx)
+        return True, score
+
+    # ---- archive I/O (sidecar to .meta) ----
+    def _archive_path_for(self, target):
+        """~/.hermes/memories/{MEMORY|USER}.md.archive"""
+        prefix = "MEMORY" if target == "memory" else "USER"
+        main_path = self._path_for(target)
+        return main_path.parent / f"{prefix}.md.archive"
+
+    def _load_archive(self, target):
+        path = self._archive_path_for(target)
+        if path.exists():
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                return {}
+        return {}
+
+    def _save_archive(self, target, archive):
+        path = self._archive_path_for(target)
+        path.write_text(
+            json.dumps(archive, indent=2, sort_keys=True, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    def _archive_evict(self, target):
+        """Evict lowest-score entry but FIRST archive it to .archive sidecar.
+
+        Scoring + capture in one pass: find lowest, write to archive, pop live.
+        Returns True if eviction succeeded (and entry is now archived).
+        Returns False if there are no live entries to evict.
+        """
+        entries = self._entries_for(target)
+        entries_meta = self._entries_meta[target]
+        if not entries:
+            return False
+        now = int(time.time())
+        scored = []
+        for i, (content, m) in enumerate(zip(entries, entries_meta)):
+            age_days = max(0.0, (now - m["created_at"]) / 86400.0)
+            score = (m["access_count"] + 1) / math.sqrt(age_days + 1)
+            scored.append((score, i, content, m))
+        scored.sort(key=lambda x: x[0])
+        score, idx, content, meta = scored[0]
+
+        # Archive first (so even if pop fails we have a copy)
+        archive = self._load_archive(target)
+        key = self._content_key(content)
+        archive[key] = {
+            "content": content,
+            "access_count": meta["access_count"],
+            "last_accessed": meta["last_accessed"],
+            "created_at": meta["created_at"],
+            "archived_at": now,
+            "evicted_score": round(score, 6),
+        }
+        self._save_archive(target, archive)
+
+        # Now pop from live state
         entries.pop(idx)
         entries_meta.pop(idx)
         return True
+
+    def list_archived(self, target):
+        """Return all archived entries for target, sorted by archived_at DESC."""
+        archive = self._load_archive(target)
+        items = []
+        for key, rec in archive.items():
+            items.append({
+                "key": key,
+                "content": rec["content"],
+                "access_count": rec["access_count"],
+                "archived_at": rec["archived_at"],
+                "evicted_score": rec.get("evicted_score", 0.0),
+            })
+        items.sort(key=lambda x: x["archived_at"], reverse=True)
+        return items
+
+    def restore_archived(self, target, key):
+        """Restore an archived entry back to live state.
+
+        Returns (success, message). On success the entry is appended to the
+        end of live entries with its original meta (ac, last_accessed, ca).
+        Note: if live is full, this may itself trigger an evict (archive) of
+        another entry -- recursion would be bad, so we surface a clear error
+        and let the user clear space first.
+        """
+        archive = self._load_archive(target)
+        if key not in archive:
+            return False, f"No archived entry with key '{key}'"
+        rec = archive[key]
+        entries = self._entries_for(target)
+        entries_meta = self._entries_meta[target]
+        if rec["content"] in entries:
+            return False, "Entry already exists in live memory (duplicate)"
+        # Capacity check
+        limit = self._char_limit(target)
+        current_chars = self._char_count(target)
+        needed = len(rec["content"]) + (len(ENTRY_DELIMITER) if entries else 0)
+        if current_chars + needed > limit:
+            return False, (
+                f"Cannot restore: would exceed {limit} char limit "
+                f"({current_chars + needed}/{limit}). Remove live entries first."
+            )
+        # Restore
+        entries.append(rec["content"])
+        entries_meta.append({
+            "access_count": rec["access_count"],
+            "last_accessed": rec["last_accessed"],
+            "created_at": rec["created_at"],
+        })
+        # Remove from archive
+        del archive[key]
+        self._save_archive(target, archive)
+        # Persist live state
+        self.save_to_disk(target)
+        return True, "Entry restored"
 
     # ---- override format_for_system_prompt to auto-touch ----
     def format_for_system_prompt(self, target):
