@@ -1034,8 +1034,12 @@ MEMORY_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "replace", "remove"],
-                "description": "The action to perform (single-op shape). Omit when using 'operations'."
+                "enum": ["add", "replace", "remove", "list_archived", "restore_archived"],
+                "description": (
+                    "The action to perform (single-op shape). Omit when using 'operations'. "
+                    "'list_archived'/'restore_archived' require HybridMemoryStore "
+                    "(see tools/memory_tool.py::HybridMemoryStore)."
+                )
             },
             "target": {
                 "type": "string",
